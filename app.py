@@ -9,7 +9,17 @@ from collections import Counter
 from urllib.parse import urlparse, parse_qs, quote
 from streamlit_calendar import calendar
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION DES FORMATIONS ---
+# Ici, on ne stocke que les IDs (la partie après "resources=")
+# Vous pourrez rajouter les autres formations de votre responsable ici.
+RESSOURCES_PROMOS = {
+    "M1 MIAGE": "54303,55713,55613,54994,54320,54315,55542,55467,55000,65286,46667",
+    "M2 MIAGE (Exemple)": "12345,67890", # À remplacer par les vrais IDs
+    "L3 MIAGE (Exemple)": "11111,22222", # À remplacer
+}
+
+BASE_URL_ADE = "https://ade-uga-ro-vs.grenet.fr/jsp/custom/modules/plannings/anonymous_cal.jsp"
+
 st.set_page_config(page_title="Calculateur ADE 35h (Promo)", page_icon="🎓", layout="wide")
 
 # --- CSS PERSONNALISÉ ---
@@ -64,22 +74,7 @@ st.markdown("""
 if 'added_blocks' not in st.session_state:
     st.session_state.added_blocks = []
 
-# --- 0. EXTRACTION DATE URL ---
-
-def get_monday_from_url(url):
-    try:
-        parsed_url = urlparse(url)
-        params = parse_qs(parsed_url.query)
-        date_str = params.get('firstDate', [None])[0]
-        if date_str:
-            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-            return date_obj - timedelta(days=date_obj.weekday())
-    except Exception:
-        pass
-    today = datetime.now()
-    return today - timedelta(days=today.weekday())
-
-# --- 1. ALGO DE DÉ-DOUBLONNAGE ---
+# --- 0. FONCTIONS UTILES ---
 
 def clean_title(title):
     patterns = [
@@ -140,8 +135,6 @@ def calculate_student_load(events):
 
     return h_cours, h_pauses
 
-# --- 2. ALGO DE TROUS COMMUNS ---
-
 def get_common_holes(all_events, week_start_date, added_blocks):
     paris_tz = pytz.timezone('Europe/Paris')
     WORK_START = time(8, 0)
@@ -192,16 +185,8 @@ def get_common_holes(all_events, week_start_date, added_blocks):
 
     return suggestions
 
-# --- 3. NOMMAGE FORMATION (SOCLE COMMUN) ---
-
 def get_formation_name(events):
-    """
-    Récupère le nom de la formation en gardant uniquement les mots
-    qui sont présents au début de la majorité des descriptions.
-    """
     if not events: return "Formation"
-
-    # 1. Nettoyage initial : on récupère toutes les premières lignes non vides
     lines = []
     for evt in events:
         desc = evt.get('Description', '')
@@ -210,44 +195,26 @@ def get_formation_name(events):
             if parts: lines.append(parts[0])
 
     if not lines: return "Formation"
-
-    # 2. Découpage en mots (tokens)
     tokenized_lines = [line.split() for line in lines]
-
-    # Si tout est vide après split
     if not any(tokenized_lines): return "Formation"
 
-    # 3. Analyse mot par mot (Intersection avec tolérance)
     common_words = []
-    max_len = max(len(l) for l in tokenized_lines) # Longueur max d'une phrase
+    max_len = max(len(l) for l in tokenized_lines)
     total_lines = len(lines)
-
-    # Seuil : Le mot doit être présent dans au moins 70% des descriptions pour être gardé
     THRESHOLD = 0.7
 
     for i in range(max_len):
-        # On récupère le i-ème mot de chaque ligne (si la ligne est assez longue)
         words_at_index = [line[i] for line in tokenized_lines if len(line) > i]
-
         if not words_at_index: break
-
-        # On regarde le mot le plus fréquent à cette position
         most_common, count = Counter(words_at_index).most_common(1)[0]
-
-        # Si ce mot est présent dans la majorité des cas (> 70%), c'est un mot du nom de la formation
         if (count / total_lines) > THRESHOLD:
             common_words.append(most_common)
         else:
-            # Dès qu'on tombe sur un mot qui varie trop (ex: "G1", "Anglais"), on arrête
             break
 
-    # 4. Reconstruction
     if common_words:
-        full_name = " ".join(common_words)
-        # Petit nettoyage final au cas où le socle commun inclut un tiret ou un espace bizarre à la fin
-        return full_name.strip(" -_")
+        return " ".join(common_words).strip(" -_")
 
-    # Fallback : si aucun mot commun, on prend le plus fréquent globalement
     return Counter(lines).most_common(1)[0][0]
 
 def get_ade_data_raw(url, week_start_date):
@@ -293,18 +260,57 @@ with col_controls:
     with st.container(border=True):
         st.subheader("Configuration")
 
-        default_url = "https://ade-uga-ro-vs.grenet.fr/jsp/custom/modules/plannings/anonymous_cal.jsp?resources=54303,55713,55613,54994,54320,54315,55542,55467,55000,65286,46667&projectId=1&calType=ical&firstDate=2026-03-09&lastDate=2026-03-15"
+        # 1. Menu Déroulant des Promos
+        options_promos = list(RESSOURCES_PROMOS.keys()) + ["🔗 URL Personnalisée"]
+        choix_promo = st.selectbox("Formation", options=options_promos)
 
-        url_ade = st.text_input("Lien ADE", value=default_url, label_visibility="collapsed")
+        # 2. Sélecteur de Date
+        # On calcule le Lundi de la semaine actuelle par défaut
+        today = datetime.now()
+        monday_current = today - timedelta(days=today.weekday())
 
-        formation_name = "Formation"
+        target_monday_date = st.date_input(
+            "Semaine du (Lundi)",
+            value=monday_current,
+            format="DD/MM/YYYY"
+        )
 
-        if url_ade:
-            target_monday = get_monday_from_url(url_ade)
-            st.caption(f"📅 Semaine du **{target_monday.strftime('%d/%m/%Y')}**")
+        # On force la date à être un Lundi si l'utilisateur choisit un autre jour
+        target_monday = datetime.combine(target_monday_date - timedelta(days=target_monday_date.weekday()), datetime.min.time())
+
+        # 3. Construction de l'URL
+        url_ade = None
+
+        if choix_promo == "🔗 URL Personnalisée":
+            url_ade = st.text_input("Coller l'URL ADE complète ici")
+            # Si URL collée, on met à jour la date cible pour matcher l'URL (si possible)
+            if url_ade:
+                try:
+                    parsed = urlparse(url_ade)
+                    d_str = parse_qs(parsed.query).get('firstDate', [None])[0]
+                    if d_str:
+                        d_obj = datetime.strptime(d_str, "%Y-%m-%d")
+                        target_monday = d_obj - timedelta(days=d_obj.weekday())
+                except: pass
         else:
-            today = datetime.now()
-            target_monday = today - timedelta(days=today.weekday())
+            # Construction dynamique
+            resources_ids = RESSOURCES_PROMOS[choix_promo]
+
+            # Formatage des dates pour ADE (YYYY-MM-DD)
+            date_debut = target_monday.strftime("%Y-%m-%d")
+            date_fin = (target_monday + timedelta(days=6)).strftime("%Y-%m-%d") # Dimanche
+
+            # Assemblage
+            url_ade = f"{BASE_URL_ADE}?resources={resources_ids}&projectId=1&calType=ical&firstDate={date_debut}&lastDate={date_fin}"
+
+            # Debug (optionnel, pour vérifier l'url générée)
+            # st.caption(f"Code ressources : `{resources_ids[:10]}...`")
+
+        st.info(f"Semaine du **{target_monday.strftime('%d/%m/%Y')}**")
+
+        # 4. Paramètre Objectif Hebdo (Bonus : pour jours fériés)
+        objectif_hebdo = st.number_input("Objectif Hebdo", min_value=0.0, max_value=45.0, value=35.0, step=1.0)
+
 
     if url_ade:
         # 1. Récupération
@@ -317,19 +323,21 @@ with col_controls:
         h_cours, h_pauses = calculate_student_load(all_events)
         h_ajoutees = sum([(b['End'] - b['Start']).total_seconds()/3600 for b in st.session_state.added_blocks])
         total = h_cours + h_pauses + h_ajoutees
-        reste = max(0, 35 - total)
+
+        # Calcul du reste basé sur l'objectif variable
+        reste = max(0, objectif_hebdo - total)
     else:
         h_cours, h_pauses, h_ajoutees, total, reste = 0, 0, 0, 0, 35
         all_events = []
 
     # --- BILAN & MAIL ---
     with st.container(border=True):
-        st.subheader("Bilan Promo")
+        st.subheader("Bilan")
 
         st.caption(f"🏷️ {formation_name}")
 
         c1, c2 = st.columns(2)
-        c1.metric("Cours (Est.)", f"{h_cours+h_pauses:.1f}h")
+        c1.metric("Cours", f"{h_cours+h_pauses:.1f}h")
         c2.metric("Ajouts", f"{h_ajoutees:.1f}h")
 
         st.divider()
@@ -343,7 +351,7 @@ with col_controls:
             if reste > 0.01:
                 st.warning(f"Manque **{reste:.2f}h**")
             else:
-                st.success("✅ 35h OK")
+                st.success(f"✅ Objectif {objectif_hebdo}h OK")
 
         # --- GÉNÉRATION DU MAIL ---
         if url_ade:
@@ -361,7 +369,7 @@ with col_controls:
                         duree = (block['End'] - block['Start']).total_seconds() / 3600
                         body += f"- Le {jour} : {debut} - {fin} ({duree:.2f}h)\n"
                 else:
-                    body += "Aucune heure supplémentaire à saisir cette semaine (35h atteintes via ADE).\n"
+                    body += f"Aucune heure supplémentaire à saisir cette semaine ({objectif_hebdo}h atteintes via ADE).\n"
 
                 body += "\nCordialement."
 
@@ -375,9 +383,9 @@ with col_controls:
                 """, unsafe_allow_html=True)
 
             else:
-                st.markdown("""
+                st.markdown(f"""
                     <a class="mailto-button-disabled">
-                         🚫 Incomplet (Total < 35h)
+                         🚫 Incomplet (Total < {objectif_hebdo}h)
                     </a>
                 """, unsafe_allow_html=True)
 
@@ -464,4 +472,4 @@ with col_calendar:
                     st.session_state.added_blocks.pop(idx)
                     st.rerun()
     else:
-        st.info("👈 Entrez l'URL ADE à droite.")
+        st.info("👈 Configurez la promo et la date à droite.")
