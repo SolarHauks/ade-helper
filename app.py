@@ -10,12 +10,10 @@ from urllib.parse import urlparse, parse_qs, quote
 from streamlit_calendar import calendar
 
 # --- CONFIGURATION DES FORMATIONS ---
-# Ici, on ne stocke que les IDs (la partie après "resources=")
-# Vous pourrez rajouter les autres formations de votre responsable ici.
 RESSOURCES_PROMOS = {
     "M1 MIAGE": "54303,55713,55613,54994,54320,54315,55542,55467,55000,65286,46667",
-    "M2 MIAGE (Exemple)": "12345,67890", # À remplacer par les vrais IDs
-    "L3 MIAGE (Exemple)": "11111,22222", # À remplacer
+    "M2 MIAGE (Exemple)": "12345,67890",
+    "L3 MIAGE (Exemple)": "11111,22222",
 }
 
 BASE_URL_ADE = "https://ade-uga-ro-vs.grenet.fr/jsp/custom/modules/plannings/anonymous_cal.jsp"
@@ -303,14 +301,6 @@ with col_controls:
             # Assemblage
             url_ade = f"{BASE_URL_ADE}?resources={resources_ids}&projectId=1&calType=ical&firstDate={date_debut}&lastDate={date_fin}"
 
-            # Debug (optionnel, pour vérifier l'url générée)
-            # st.caption(f"Code ressources : `{resources_ids[:10]}...`")
-
-        st.info(f"Semaine du **{target_monday.strftime('%d/%m/%Y')}**")
-
-        # 4. Paramètre Objectif Hebdo (Bonus : pour jours fériés)
-        objectif_hebdo = st.number_input("Objectif Hebdo", min_value=0.0, max_value=45.0, value=35.0, step=1.0)
-
 
     if url_ade:
         # 1. Récupération
@@ -324,11 +314,13 @@ with col_controls:
         h_ajoutees = sum([(b['End'] - b['Start']).total_seconds()/3600 for b in st.session_state.added_blocks])
         total = h_cours + h_pauses + h_ajoutees
 
-        # Calcul du reste basé sur l'objectif variable
-        reste = max(0, objectif_hebdo - total)
+        # Calcul du reste basé sur 35h
+        reste = max(0, 35 - total)
     else:
+        # ICI LA CORRECTION : Initialisation des variables vides si pas d'URL
         h_cours, h_pauses, h_ajoutees, total, reste = 0, 0, 0, 0, 35
         all_events = []
+        formation_name = "..."  # <--- Ajout de cette variable pour éviter le NameError
 
     # --- BILAN & MAIL ---
     with st.container(border=True):
@@ -351,7 +343,7 @@ with col_controls:
             if reste > 0.01:
                 st.warning(f"Manque **{reste:.2f}h**")
             else:
-                st.success(f"✅ Objectif {objectif_hebdo}h OK")
+                st.success(f"✅ Objectif 35h OK")
 
         # --- GÉNÉRATION DU MAIL ---
         if url_ade:
@@ -369,7 +361,7 @@ with col_controls:
                         duree = (block['End'] - block['Start']).total_seconds() / 3600
                         body += f"- Le {jour} : {debut} - {fin} ({duree:.2f}h)\n"
                 else:
-                    body += f"Aucune heure supplémentaire à saisir cette semaine ({objectif_hebdo}h atteintes via ADE).\n"
+                    body += f"Aucune heure supplémentaire à saisir cette semaine (35h atteintes via ADE).\n"
 
                 body += "\nCordialement."
 
@@ -385,7 +377,7 @@ with col_controls:
             else:
                 st.markdown(f"""
                     <a class="mailto-button-disabled">
-                         🚫 Incomplet (Total < {objectif_hebdo}h)
+                         🚫 Incomplet (Total < 35h)
                     </a>
                 """, unsafe_allow_html=True)
 
@@ -447,7 +439,7 @@ with col_calendar:
             "initialView": "timeGridWeek",
             "initialDate": target_monday.strftime("%Y-%m-%d"),
             "slotMinTime": "08:00:00",
-            "slotMaxTime": "19:00:00",
+            "slotMaxTime": "18:30:00",
             "allDaySlot": False,
             "locale": "fr",
             "height": 750,
