@@ -1,21 +1,62 @@
 import streamlit as st
 import requests
 from icalendar import Calendar
-import pandas as pd
 from datetime import datetime, timedelta, time
 import pytz
 import re
 import difflib
-from urllib.parse import urlparse, parse_qs
+from collections import Counter
+from urllib.parse import urlparse, parse_qs, quote
 from streamlit_calendar import calendar
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Calculateur ADE 35h (Promo)", page_icon="🎓", layout="wide")
 
+# --- CSS PERSONNALISÉ ---
 st.markdown("""
     <style>
         .block-container { padding-top: 1rem; padding-bottom: 2rem; }
         [data-testid="stMetricValue"] { font-size: 1.5rem; }
+        
+        .mailto-button {
+            display: inline-block;
+            padding: 0.6em 1em;
+            color: white !important;
+            background-color: #22c55e;
+            text-decoration: none !important;
+            border-radius: 8px;
+            font-weight: bold;
+            text-align: center;
+            width: 100%;
+            margin-top: 15px;
+            margin-bottom: 15px;
+            border: 1px solid #22c55e;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+        }
+        .mailto-button:hover {
+            background-color: #16a34a;
+            border-color: #16a34a;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.15);
+        }
+
+        .mailto-button-disabled {
+            display: inline-block;
+            padding: 0.6em 1em;
+            color: #9ca3af !important;
+            background-color: #e5e7eb;
+            text-decoration: none !important;
+            border-radius: 8px;
+            font-weight: bold;
+            text-align: center;
+            width: 100%;
+            margin-top: 15px;
+            margin-bottom: 15px;
+            border: 1px solid #d1d5db;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -26,18 +67,15 @@ if 'added_blocks' not in st.session_state:
 # --- 0. EXTRACTION DATE URL ---
 
 def get_monday_from_url(url):
-    """Extrait la date 'firstDate' de l'URL ADE."""
     try:
         parsed_url = urlparse(url)
         params = parse_qs(parsed_url.query)
         date_str = params.get('firstDate', [None])[0]
-
         if date_str:
             date_obj = datetime.strptime(date_str, "%Y-%m-%d")
             return date_obj - timedelta(days=date_obj.weekday())
     except Exception:
         pass
-
     today = datetime.now()
     return today - timedelta(days=today.weekday())
 
@@ -154,6 +192,64 @@ def get_common_holes(all_events, week_start_date, added_blocks):
 
     return suggestions
 
+# --- 3. NOMMAGE FORMATION (SOCLE COMMUN) ---
+
+def get_formation_name(events):
+    """
+    Récupère le nom de la formation en gardant uniquement les mots
+    qui sont présents au début de la majorité des descriptions.
+    """
+    if not events: return "Formation"
+
+    # 1. Nettoyage initial : on récupère toutes les premières lignes non vides
+    lines = []
+    for evt in events:
+        desc = evt.get('Description', '')
+        if desc:
+            parts = [l.strip() for l in desc.split('\n') if l.strip()]
+            if parts: lines.append(parts[0])
+
+    if not lines: return "Formation"
+
+    # 2. Découpage en mots (tokens)
+    tokenized_lines = [line.split() for line in lines]
+
+    # Si tout est vide après split
+    if not any(tokenized_lines): return "Formation"
+
+    # 3. Analyse mot par mot (Intersection avec tolérance)
+    common_words = []
+    max_len = max(len(l) for l in tokenized_lines) # Longueur max d'une phrase
+    total_lines = len(lines)
+
+    # Seuil : Le mot doit être présent dans au moins 70% des descriptions pour être gardé
+    THRESHOLD = 0.7
+
+    for i in range(max_len):
+        # On récupère le i-ème mot de chaque ligne (si la ligne est assez longue)
+        words_at_index = [line[i] for line in tokenized_lines if len(line) > i]
+
+        if not words_at_index: break
+
+        # On regarde le mot le plus fréquent à cette position
+        most_common, count = Counter(words_at_index).most_common(1)[0]
+
+        # Si ce mot est présent dans la majorité des cas (> 70%), c'est un mot du nom de la formation
+        if (count / total_lines) > THRESHOLD:
+            common_words.append(most_common)
+        else:
+            # Dès qu'on tombe sur un mot qui varie trop (ex: "G1", "Anglais"), on arrête
+            break
+
+    # 4. Reconstruction
+    if common_words:
+        full_name = " ".join(common_words)
+        # Petit nettoyage final au cas où le socle commun inclut un tiret ou un espace bizarre à la fin
+        return full_name.strip(" -_")
+
+    # Fallback : si aucun mot commun, on prend le plus fréquent globalement
+    return Counter(lines).most_common(1)[0][0]
+
 def get_ade_data_raw(url, week_start_date):
     try:
         response = requests.get(url)
@@ -170,6 +266,7 @@ def get_ade_data_raw(url, week_start_date):
     for event in cal.walk('vevent'):
         dtstart, dtend = event.get('dtstart').dt, event.get('dtend').dt
         summary = str(event.get('summary', ''))
+        description = str(event.get('description', ''))
 
         if not isinstance(dtstart, datetime): continue
         if dtstart.tzinfo is None: dtstart = utc.localize(dtstart)
@@ -177,7 +274,12 @@ def get_ade_data_raw(url, week_start_date):
         start, end = dtstart.astimezone(paris_tz), dtend.astimezone(paris_tz)
 
         if start >= week_start and start < week_end:
-            raw_events.append({'Start': start, 'End': end, 'Title': summary})
+            raw_events.append({
+                'Start': start,
+                'End': end,
+                'Title': summary,
+                'Description': description
+            })
 
     return raw_events
 
@@ -193,8 +295,9 @@ with col_controls:
 
         default_url = "https://ade-uga-ro-vs.grenet.fr/jsp/custom/modules/plannings/anonymous_cal.jsp?resources=54303,55713,55613,54994,54320,54315,55542,55467,55000,65286,46667&projectId=1&calType=ical&firstDate=2026-03-09&lastDate=2026-03-15"
 
-        # Le simple fait de changer ce champ relance tout le script
         url_ade = st.text_input("Lien ADE", value=default_url, label_visibility="collapsed")
+
+        formation_name = "Formation"
 
         if url_ade:
             target_monday = get_monday_from_url(url_ade)
@@ -207,7 +310,10 @@ with col_controls:
         # 1. Récupération
         all_events = get_ade_data_raw(url_ade, target_monday)
 
-        # 2. Calculs
+        # 2. Identification Formation
+        formation_name = get_formation_name(all_events)
+
+        # 3. Calculs
         h_cours, h_pauses = calculate_student_load(all_events)
         h_ajoutees = sum([(b['End'] - b['Start']).total_seconds()/3600 for b in st.session_state.added_blocks])
         total = h_cours + h_pauses + h_ajoutees
@@ -216,9 +322,11 @@ with col_controls:
         h_cours, h_pauses, h_ajoutees, total, reste = 0, 0, 0, 0, 35
         all_events = []
 
-    # --- BILAN ---
+    # --- BILAN & MAIL ---
     with st.container(border=True):
         st.subheader("Bilan Promo")
+
+        st.caption(f"🏷️ {formation_name}")
 
         c1, c2 = st.columns(2)
         c1.metric("Cours (Est.)", f"{h_cours+h_pauses:.1f}h")
@@ -226,19 +334,52 @@ with col_controls:
 
         st.divider()
 
-        # --- MODIFICATION ICI : Colonnes pour Total et Manque ---
-        c_tot, c_rem = st.columns([1, 1.2]) # On sépare la ligne en 2
+        c_tot, c_rem = st.columns([1, 1.2])
 
         with c_tot:
-            st.metric("Total / Étudiant", f"{total:.2f}h")
+            st.metric("Total", f"{total:.2f}h")
 
         with c_rem:
-            # On affiche l'alerte ou le succès à côté
             if reste > 0.01:
                 st.warning(f"Manque **{reste:.2f}h**")
             else:
-                st.success("✅ 35h atteintes")
-        # --------------------------------------------------------
+                st.success("✅ 35h OK")
+
+        # --- GÉNÉRATION DU MAIL ---
+        if url_ade:
+            if reste <= 0.01:
+                subject = f"Saisie heures complémentaires [{formation_name}] - Semaine du {target_monday.strftime('%d/%m/%Y')}"
+
+                body = f"Bonjour,\n\nConcernant la formation {formation_name}, voici les créneaux complémentaires à saisir pour la semaine du {target_monday.strftime('%d/%m/%Y')} :\n\n"
+
+                if st.session_state.added_blocks:
+                    sorted_blocks = sorted(st.session_state.added_blocks, key=lambda x: x['Start'])
+                    for block in sorted_blocks:
+                        jour = block['Start'].strftime('%d/%m')
+                        debut = block['Start'].strftime('%Hh%M')
+                        fin = block['End'].strftime('%Hh%M')
+                        duree = (block['End'] - block['Start']).total_seconds() / 3600
+                        body += f"- Le {jour} : {debut} - {fin} ({duree:.2f}h)\n"
+                else:
+                    body += "Aucune heure supplémentaire à saisir cette semaine (35h atteintes via ADE).\n"
+
+                body += "\nCordialement."
+
+                recipient = "ajpbordes@gmail.com"
+                mailto_link = f"mailto:{recipient}?subject={quote(subject)}&body={quote(body)}"
+
+                st.markdown(f"""
+                    <a href="{mailto_link}" target="_blank" class="mailto-button">
+                        ✉️ Envoyer pour saisie
+                    </a>
+                """, unsafe_allow_html=True)
+
+            else:
+                st.markdown("""
+                    <a class="mailto-button-disabled">
+                         🚫 Incomplet (Total < 35h)
+                    </a>
+                """, unsafe_allow_html=True)
 
 # --- CALENDRIER ---
 with col_calendar:
